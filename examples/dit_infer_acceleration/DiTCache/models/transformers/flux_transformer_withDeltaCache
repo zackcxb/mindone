@@ -1,0 +1,285 @@
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import mindspore as ms
+from mindspore import ops
+
+from mindone.diffusers.models.transformers.transformer_2d import Transformer2DModelOutput
+
+def single_transformer_blocks_withcache(
+    self,
+    hidden_states,
+    image_rotary_emb,
+    temb,
+    cache_idx,
+    save_idx,
+    delta_cache,    
+):
+    cache_start, cache_end = cache_idx
+    save_start, save_end = save_idx
+    blocks = self.single_transformer_blocks
+
+    if use_cache:
+        assert delta_cache is not None, "delta_cache is None when use_cache is True"
+    
+    hidden_states_before_cache = hidden_states.copy() #目前的实现默认mmdit偏置计算从最初的hiddenstates开始，即cache start=save start=0
+    # hidden_states_before_cache = ops.zeros_like(hidden_states, dtype=hidden_states.dtype)
+    if cache_start==cache_end:
+        if save_start == save_end:
+            for index_block, block in enumerate(blocks):
+                hidden_states = block(
+                    hidden_states=hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            delta_cache = None
+        else: 
+            # infer 至 save处
+            for index_block, block in enumerate(blocks[:save_end]):
+                hidden_states = block(
+                    hidden_states=hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            delta_cache = hidden_states - hidden_states_before_cache
+            for index_block, block in enumerate(blocks[save_end:]):
+                hidden_states = block(
+                    hidden_states=hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+    else: # 要进行cache
+        hidden_states = hidden_states_before_cache + delta_cache
+
+        if save_end==save_start:
+            # infer [cache_end, len(self.blocks))
+            for index_block, block in enumerate(blocks[cache_end:]):
+                hidden_states = block(
+                    hidden_states=hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            delta_cache = None
+        else:
+            for index_block, block in enumerate(blocks[cache_end:save_end]):
+                hidden_states = block(
+                    hidden_states=hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            delta_cache = hidden_states - hidden_states_before_cache
+            for index_block, block in enumerate(blocks[save_end:]):
+                hidden_states = block(
+                    hidden_states=hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+
+    return hidden_states, delta_cache
+
+
+def transformer_blocks_withcache(
+    self,
+    hidden_states,
+    encoder_hidden_stas,
+    image_rotary_emb,
+    temb,
+    cache_idx,
+    save_idx,
+    delta_cache,
+    delta_cache_encoder
+):
+    cache_start, cache_end = cache_idx
+    save_start, save_end = save_idx
+    blocks = self.transformer_blocks
+
+    if use_cache:
+        assert delta_cache is not None, "delta_cache is None when use_cache is True"
+    
+    hidden_states_before_cache = hidden_states.copy() #目前的实现默认mmdit偏置计算从最初的hiddenstates开始，即cache start=save start=0
+    encoder_hidden_states_before_cache = encoder_hidden_states.copy() #目前的实现默认mmdit偏置计算从最初的hiddenstates开始，即cache start=save start=0
+
+    if cache_start==cache_end:
+        if save_start == save_end:
+            for index_block, block in enumerate(blocks):
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            delta_cache = None
+            delta_cache_encoder = None
+        else: 
+            # infer 至 save处
+            for index_block, block in enumerate(blocks[:save_end]):
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            delta_cache = hidden_states - hidden_states_before_cache
+            delta_cache_encoder = encoder_hidden_states - encoder_hidden_states_before_cache
+            for index_block, block in enumerate(blocks[save_end:]):
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+    else: # 要进行cache
+        hidden_states = hidden_states_before_cache + delta_cache
+        encoder_hidden_states = encoder_hidden_states_before_cache + delta_cache_encoder
+
+        if save_end==save_start:
+            # infer [cache_end, len(self.blocks))
+            for index_block, block in enumerate(blocks[cache_end:]):
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            delta_cache = None
+            delta_cache_encoder = None
+        else:
+            for index_block, block in enumerate(blocks[cache_end:save_end]):
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+            delta_cache = hidden_states - hidden_states_before_cache
+            delta_cache_encoder = encoder_hidden_states - encoder_hidden_states_before_cache
+            for index_block, block in enumerate(blocks[save_end:]):
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+
+    return (encoder_hidden_states, hidden_states), delta_cache, encoder_delta_cache
+           
+
+def flux_transformer2d_construct(
+    self,
+    hidden_states: ms.Tensor,
+    encoder_hidden_states: ms.Tensor = None,
+    pooled_projections: ms.Tensor = None,
+    timestep: ms.Tensor = None,
+    img_ids: ms.Tensor = None,
+    txt_ids: ms.Tensor = None,
+    guidance: ms.Tensor = None,
+    joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    controlnet_block_samples=None,
+    controlnet_single_block_samples=None,
+    return_dict: bool = False,
+    controlnet_blocks_repeat: bool = False,
+    cache_idx: Optional[Tuple[int, int]] = None,
+    save_idx: Optional[Tuple[int, int]] = None,
+    single_cache_idx: Optional[Tuple[int, int]] = None,
+    single_save_idx: Optional[Tuple[int, int]] = None,
+    delta_cache: ms.Tensor = None,
+    delta_cache_hidden: ms.Tensor = None,
+) -> Union[ms.Tensor, Transformer2DModelOutput, Tuple]:
+        """
+        The [`FluxTransformer2DModel`] forward method.
+
+        Args:
+            hidden_states (`ms.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
+                Input `hidden_states`.
+            encoder_hidden_states (`ms.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
+                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
+            pooled_projections (`ms.Tensor` of shape `(batch_size, projection_dim)`): Embeddings projected
+                from the embeddings of input conditions.
+            timestep ( `ms.Tensor`):
+                Used to indicate denoising step.
+            block_controlnet_hidden_states: (`list` of `ms.Tensor`):
+                A list of tensors that if specified are added to the residuals of transformer blocks.
+            joint_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            return_dict (`bool`, *optional*, defaults to `False`):
+                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
+                tuple.
+
+        Returns:
+            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
+            `tuple` where the first element is the sample tensor.
+        """
+
+        if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
+            logger.warning(
+                "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
+            )
+
+        hidden_states = self.x_embedder(hidden_states)
+
+        timestep = timestep.to(hidden_states.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype) * 1000
+
+        temb = (
+            self.time_text_embed(timestep, pooled_projections)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, pooled_projections)
+        )
+        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+
+        if txt_ids.ndim == 3:
+            logger.warning(
+                "Passing `txt_ids` 3d ms.Tensor is deprecated."
+                "Please remove the batch dimension and pass it as a 2d mindspore Tensor"
+            )
+            txt_ids = txt_ids[0]
+        if img_ids.ndim == 3:
+            logger.warning(
+                "Passing `img_ids` 3d ms.Tensor is deprecated."
+                "Please remove the batch dimension and pass it as a 2d mindspore Tensor"
+            )
+            img_ids = img_ids[0]
+
+        ids = mint.cat((txt_ids, img_ids), dim=0)
+        image_rotary_emb = self.pos_embed(ids)
+
+        if joint_attention_kwargs is not None and "ip_adapter_image_embeds" in joint_attention_kwargs:
+            ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
+            ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
+            joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
+
+        ((encoder_hidden_states, hidden_states), delta_cache, delta_cache_hidden) = self.transformer_blocks_with_cache(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+        #TODO: ControlNet residual not implemented
+        hidden_states = mint.cat([encoder_hidden_states, hidden_states], dim=1)
+
+        (hidden_states, single_delta_cache) = self.single_transformer_blocks_with_cache(
+                hidden_states=hidden_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+
+        # hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
+        hidden_states = mint.split(
+            hidden_states,
+            [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]],
+            dim=1,
+        )[1]
+
+        hidden_states = self.norm_out(hidden_states, temb)
+        output = self.proj_out(hidden_states)
+
+        if not return_dict:
+            return (output, delta_cache, delta_cache_hidden, single_delta_cache)
+
+        return Transformer2DModelOutput(sample=output)
+
+

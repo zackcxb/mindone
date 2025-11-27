@@ -45,7 +45,7 @@ from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, can_return_tuple
 from ...utils.generic import check_model_inputs
-
+import pdb
 
 class Qwen3VLVisionMLP(nn.Cell):
     def __init__(self, config):
@@ -184,7 +184,18 @@ class Qwen3VLVisionAttention(nn.Cell):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
-
+    def _collect_image_key_similarity(self, key_states, cu_seqlens):
+        if cu_seqlens.shape[0] < 3:
+            return None
+        similarities = []
+        key_states = key_states.mean(axis=1)
+        key_states = key_states/ops.norm(key_states, dim=-1,keepdim=True)
+        for i in range(cu_seqlens.size - 2):
+            segment1 = key_states[cu_seqlens[i]:cu_seqlens[i+1]]  # [seq_len, head_dim]
+            segment2 = key_states[cu_seqlens[i+1]:cu_seqlens[i+2]] # [seq_len, head_dim]
+            #similarities.append(segment1 @ segment2.swapaxes(0, 1))
+            similarities.append((segment1 * segment2).sum(axis=1))
+        return similarities
     def construct(
         self,
         hidden_states: ms.Tensor,
@@ -199,7 +210,8 @@ class Qwen3VLVisionAttention(nn.Cell):
         )
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
-
+        key_similarities = self._collect_image_key_similarity(key_states, cu_seqlens)
+        query_similarities = self._collect_image_key_similarity(query_states, cu_seqlens)
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]

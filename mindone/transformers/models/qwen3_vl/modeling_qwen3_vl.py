@@ -45,7 +45,8 @@ from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, can_return_tuple
 from ...utils.generic import check_model_inputs
-import pdb
+
+TOKEN_SIM_EPS = 1e-6
 
 class Qwen3VLVisionMLP(nn.Cell):
     def __init__(self, config):
@@ -184,24 +185,48 @@ class Qwen3VLVisionAttention(nn.Cell):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
-    def _collect_image_key_similarity(self, key_states, cu_seqlens):
+
+    def _collect_image_key_similarity(self, key_states, cu_seqlens, match_position: bool = True):
         if cu_seqlens.shape[0] < 3:
             return None
         similarities = []
         key_states = key_states.mean(axis=1)
-        key_states = key_states/ops.norm(key_states, dim=-1,keepdim=True)
+        key_states = key_states / ops.norm(key_states, dim=-1, keepdim=True)
         for i in range(cu_seqlens.size - 2):
-            segment1 = key_states[cu_seqlens[i]:cu_seqlens[i+1]]  # [seq_len, head_dim]
-            segment2 = key_states[cu_seqlens[i+1]:cu_seqlens[i+2]] # [seq_len, head_dim]
-            #similarities.append(segment1 @ segment2.swapaxes(0, 1))
-            similarities.append((segment1 * segment2).sum(axis=1))
+            segment1 = key_states[cu_seqlens[i] : cu_seqlens[i + 1]]  # [seq_len, head_dim]
+            segment2 = key_states[cu_seqlens[i + 1] : cu_seqlens[i + 2]]  # [seq_len, head_dim]
+            if match_position:
+                similarities.append((segment1 * segment2).sum(axis=1))
+            else:
+                similarities.append(segment1 @ segment2.swapaxes(0, 1))
         return similarities
+
+    def _expand_kv_with_prune_info(self, key_states, value_states, prune_info, cu_seqlens):
+
+        seq1_keys = key_states[:cu_seqlens[1]]
+        seq1_values = value_states[:cu_seqlens[1]]
+        seq2_keys_pruned = key_states[cu_seqlens[1] : cu_seqlens[2]]
+        seq2_values_pruned = value_states[cu_seqlens[1] : cu_seqlens[2]]
+
+        gather_indices = prune_info["removed_indices"]
+        seq2_keys_shared = ops.gather(seq1_keys, gather_indices, 0)
+        seq2_values_shared = ops.gather(seq1_values, gather_indices, 0)
+
+        seq2_keys_full = mint.cat([seq2_keys_pruned, seq2_keys_shared], axis=0)
+        seq2_values_full = mint.cat([seq2_values_pruned, seq2_values_shared], axis=0)
+
+        key_states = mint.cat([seq1_keys, seq2_keys_full], axis=0)
+        value_states = mint.cat([seq1_values, seq2_values_full], axis=0)
+        return key_states, value_states
+
     def construct(
         self,
         hidden_states: ms.Tensor,
         cu_seqlens: ms.Tensor,
         rotary_pos_emb: Optional[ms.Tensor] = None,
         position_embeddings: Optional[tuple[ms.Tensor, ms.Tensor]] = None,
+        prune_info: Optional[dict] = None,
+        block_idx: int = 0,
         **kwargs,
     ) -> ms.Tensor:
         seq_length = hidden_states.shape[0]
@@ -210,12 +235,20 @@ class Qwen3VLVisionAttention(nn.Cell):
         )
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
-        key_similarities = self._collect_image_key_similarity(key_states, cu_seqlens)
-        query_similarities = self._collect_image_key_similarity(query_states, cu_seqlens)
+        
+        ## save kv similarity matrix for debugging
+        # key_similarities = self._collect_image_key_similarity(key_states, cu_seqlens)
+        # query_similarities = self._collect_image_key_similarity(query_states, cu_seqlens)
+        # np.save(f"home/caoxb/ViT_profile/similarity_24-26/k_similarity_{block_idx}.npy", key_similarities[0].astype(ms.float16).asnumpy(), allow_pickle=True)
+        # np.save(f"home/caoxb/ViT_profile/similarity_24-26/q_similarity_{block_idx}.npy", query_similarities[0].astype(ms.float16).asnumpy(), allow_pickle=True)
+        
+        if prune_info is not None and block_idx >= 1:
+            key_states, value_states = self._expand_kv_with_prune_info(key_states, value_states, prune_info, cu_seqlens)
+        kv_seq_length = key_states.shape[0]
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
+        kv_cu_seqlens = prune_info["original_cu_seqlens"] if prune_info is not None else cu_seqlens
         if self.config._attn_implementation == "flash_attention_2":
             attn_output = ops.flash_attention_score(
                 query_states,
@@ -223,7 +256,7 @@ class Qwen3VLVisionAttention(nn.Cell):
                 value_states,
                 self.num_heads,
                 actual_seq_qlen=cu_seqlens,
-                actual_seq_kvlen=cu_seqlens,
+                actual_seq_kvlen=kv_cu_seqlens,
                 scalar_value=1 / math.sqrt(query_states.shape[-1]),
                 input_layout="TND",
             )
@@ -232,9 +265,9 @@ class Qwen3VLVisionAttention(nn.Cell):
             key_states = key_states.swapaxes(0, 1).unsqueeze(0)
             value_states = value_states.swapaxes(0, 1).unsqueeze(0)
 
-            attention_mask = mint.zeros([1, seq_length, seq_length], dtype=ms.bool_)
+            attention_mask = mint.zeros([1, seq_length, kv_seq_length], dtype=ms.bool_)
             for i in range(1, len(cu_seqlens)):
-                attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = True
+                attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], kv_cu_seqlens[i - 1] : kv_cu_seqlens[i]] = True
             attention_mask = attention_mask.unsqueeze(1)
 
             attn_output = attention_interface(
@@ -268,6 +301,8 @@ class Qwen3VLVisionBlock(GradientCheckpointingLayer):
         cu_seqlens: ms.Tensor,
         rotary_pos_emb: Optional[ms.Tensor] = None,
         position_embeddings: Optional[tuple[ms.Tensor, ms.Tensor]] = None,
+        prune_info: Optional[dict] = None,
+        block_idx: int = 0,
         **kwargs,
     ) -> ms.Tensor:
         hidden_states = hidden_states + self.attn(
@@ -275,6 +310,8 @@ class Qwen3VLVisionBlock(GradientCheckpointingLayer):
             cu_seqlens=cu_seqlens,
             rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
+            prune_info=prune_info,
+            block_idx=block_idx,
             **kwargs,
         )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
@@ -603,6 +640,58 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         )
 
         self.gradient_checkpointing = False
+        # TODO: add config for token prune
+        # self.token_prune_enabled = getattr(config, "token_prune_enabled", False)
+        # self.token_prune_threshold = getattr(config, "token_prune_threshold", 0.99)
+        self.token_prune_enabled = True
+        self.token_prune_threshold = 0.99
+
+    def _should_prune(self, cu_seqlens: ms.Tensor) -> bool:
+        return bool(self.token_prune_enabled and cu_seqlens.shape[0] >= 3)
+
+    def _compute_token_similarity(self, seq1: ms.Tensor, seq2: ms.Tensor) -> ms.Tensor:
+        seq1_norm = seq1 / (ops.norm(seq1, dim=-1, keepdim=True) + TOKEN_SIM_EPS)
+        seq2_norm = seq2 / (ops.norm(seq2, dim=-1, keepdim=True) + TOKEN_SIM_EPS)
+        return (seq1_norm * seq2_norm).sum(axis=-1)
+
+    def _prune_second_sequence(
+        self,
+        hidden_states: ms.Tensor,
+        cu_seqlens: ms.Tensor,
+    ) -> tuple[ms.Tensor, ms.Tensor, Optional[dict]]:
+        assert cu_seqlens.shape[0] == 3, "cu_seqlens should have 3 elements"
+        seq1_len = int(cu_seqlens[1].asnumpy().item())
+        seq2_len = int((cu_seqlens[2] - cu_seqlens[1]).asnumpy().item())
+        seq1_states = hidden_states[:seq1_len]
+        seq2_states = hidden_states[seq1_len : seq1_len + seq2_len]
+
+        similarities = self._compute_token_similarity(seq1_states, seq2_states)
+        # threshold = ms.Tensor(self.token_prune_threshold, dtype=similarities.dtype)
+        remove_mask = (similarities > self.token_prune_threshold).astype(ms.bool_)
+        keep_mask = ops.logical_not(remove_mask)
+        keep_count = int(keep_mask.astype(ms.int32).sum().asnumpy().item())
+        if keep_count == seq2_len or keep_count == 0:
+            return hidden_states, cu_seqlens, None
+
+        keep_indices = ops.nonzero(keep_mask.astype(ms.int32)).flatten().astype(ms.int32)
+        removed_indices = ops.nonzero(remove_mask.astype(ms.int32)).flatten().astype(ms.int32)
+        seq2_kept = ops.gather(seq2_states, keep_indices, 0)
+
+        new_hidden_states = mint.cat(
+            [hidden_states[:seq1_len], seq2_kept], dim=0
+        )
+
+        keep_count_tensor = ms.Tensor(keep_count, dtype=cu_seqlens.dtype)
+        new_cu = mint.cat([cu_seqlens[:2], keep_count_tensor], dim=0)
+
+        prune_info = {
+            "removed_mask": remove_mask,
+            "keep_mask": keep_mask,
+            "original_cu_seqlens": cu_seqlens,
+            "keep_indices": keep_indices,
+            "removed_indices": removed_indices,
+        }
+        return new_hidden_states, new_cu, prune_info
 
     def rot_pos_emb(self, grid_thw: ms.Tensor) -> ms.Tensor:
         merge_size = self.spatial_merge_size
@@ -738,11 +827,18 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
         deepstack_feature_lists = []
+        prune_state: Optional[dict] = None
         for layer_num, blk in enumerate(self.blocks):
+            if layer_num == 0 and self._should_prune(cu_seqlens):
+                hidden_states, cu_seqlens, prune_state = self._prune_second_sequence(hidden_states, cu_seqlens)
+                # cu_seqlens contains the lengths after pruning
+            prune_info = prune_state if prune_state is not None and layer_num >= 1 else None
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
+                prune_info=prune_info,
+                block_idx=layer_num,
                 **kwargs,
             )
             if layer_num in self.deepstack_visual_indexes:

@@ -172,6 +172,20 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+def expand_sequence_with_prune_info(sequence: ms.Tensor, prune_info: dict, cu_seqlens: ms.Tensor) -> ms.Tensor:
+
+    seq1_states = sequence[:cu_seqlens[1]]
+    seq2_states_pruned = sequence[cu_seqlens[1] : cu_seqlens[2]]
+
+    gather_indices = prune_info["removed_indices"]
+    seq2_states_shared = ops.gather(seq1_states, gather_indices, 0)
+
+    seq2_states_full = mint.cat([seq2_states_pruned, seq2_states_shared], dim=0)
+
+    new_sequence = mint.cat([seq1_states, seq2_states_full], dim=0)
+    return new_sequence
+
+
 class Qwen3VLVisionAttention(nn.Cell):
     def __init__(self, config: Qwen3VLVisionConfig) -> None:
         super().__init__()
@@ -201,24 +215,6 @@ class Qwen3VLVisionAttention(nn.Cell):
                 similarities.append(segment1 @ segment2.swapaxes(0, 1))
         return similarities
 
-    def _expand_kv_with_prune_info(self, key_states, value_states, prune_info, cu_seqlens):
-
-        seq1_keys = key_states[:cu_seqlens[1]]
-        seq1_values = value_states[:cu_seqlens[1]]
-        seq2_keys_pruned = key_states[cu_seqlens[1] : cu_seqlens[2]]
-        seq2_values_pruned = value_states[cu_seqlens[1] : cu_seqlens[2]]
-
-        gather_indices = prune_info["removed_indices"]
-        seq2_keys_shared = ops.gather(seq1_keys, gather_indices, 0)
-        seq2_values_shared = ops.gather(seq1_values, gather_indices, 0)
-
-        seq2_keys_full = mint.cat([seq2_keys_pruned, seq2_keys_shared], axis=0)
-        seq2_values_full = mint.cat([seq2_values_pruned, seq2_values_shared], axis=0)
-
-        key_states = mint.cat([seq1_keys, seq2_keys_full], axis=0)
-        value_states = mint.cat([seq1_values, seq2_values_full], axis=0)
-        return key_states, value_states
-
     def construct(
         self,
         hidden_states: ms.Tensor,
@@ -242,8 +238,9 @@ class Qwen3VLVisionAttention(nn.Cell):
         # np.save(f"home/caoxb/ViT_profile/similarity_24-26/k_similarity_{block_idx}.npy", key_similarities[0].astype(ms.float16).asnumpy(), allow_pickle=True)
         # np.save(f"home/caoxb/ViT_profile/similarity_24-26/q_similarity_{block_idx}.npy", query_similarities[0].astype(ms.float16).asnumpy(), allow_pickle=True)
         
-        if prune_info is not None and block_idx >= 1:
-            key_states, value_states = self._expand_kv_with_prune_info(key_states, value_states, prune_info, cu_seqlens)
+        if prune_info is not None and block_idx >= 1: #TODO: 可以为裁剪开始设置一个参数
+            key_states = expand_sequence_with_prune_info(key_states, prune_info, cu_seqlens)
+            value_states = expand_sequence_with_prune_info(value_states, prune_info, cu_seqlens)
         kv_seq_length = key_states.shape[0]
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -698,7 +695,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         cos = self._prune_second_sequence(cos, cu_seqlens, keep_indices)
         sin = self._prune_second_sequence(sin, cu_seqlens, keep_indices)
         
-        position_embeddings = (cos, sin)
+        new_position_embeddings = (cos, sin)
 
         prune_info = {
             "removed_mask": remove_mask,
@@ -706,8 +703,9 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
             "original_cu_seqlens": cu_seqlens,
             "keep_indices": keep_indices,
             "removed_indices": removed_indices,
+            "original_position_embeddings": position_embeddings,
         }
-        return new_hidden_states, new_cu, position_embeddings, prune_info
+        return new_hidden_states, new_cu, new_position_embeddings, prune_info
 
     def rot_pos_emb(self, grid_thw: ms.Tensor) -> ms.Tensor:
         merge_size = self.spatial_merge_size
@@ -843,13 +841,16 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
         deepstack_feature_lists = []
-        prune_state: Optional[dict] = None
+        prune_info: Optional[dict] = None
         for layer_num, blk in enumerate(self.blocks):
             if layer_num == 1 and self._should_prune(cu_seqlens):
-                hidden_states, cu_seqlens, position_embeddings, prune_state = self._prune_hidden_states_position_embeddings(hidden_states, cu_seqlens, position_embeddings)
+                hidden_states, cu_seqlens, position_embeddings, prune_info = self._prune_hidden_states_position_embeddings(hidden_states, cu_seqlens, position_embeddings)
                 # cu_seqlens contains the lengths after pruning
-                
-            prune_info = prune_state if prune_state is not None and layer_num >= 1 else None
+            if layer_num == self.config.depth - 1:
+                hidden_states = expand_sequence_with_prune_info(hidden_states, prune_info, cu_seqlens)
+                cu_seqlens = prune_info["original_cu_seqlens"]
+                position_embeddings = prune_info["original_position_embeddings"]
+                prune_info = None
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,

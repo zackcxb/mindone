@@ -654,10 +654,17 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         seq2_norm = seq2 / (ops.norm(seq2, dim=-1, keepdim=True) + TOKEN_SIM_EPS)
         return (seq1_norm * seq2_norm).sum(axis=-1)
 
-    def _prune_second_sequence(
+    def _prune_second_sequence(self, sequence: ms.Tensor, cu_seqlens: ms.Tensor, gather_indices: ms.Tensor) -> ms.Tensor:
+        seq1_states = sequence[:cu_seqlens[1]]
+        seq2_states = sequence[cu_seqlens[1] : cu_seqlens[2]]
+        seq2_kept = ops.gather(seq2_states, gather_indices, 0)
+        new_sequence = mint.cat([seq1_states, seq2_kept], dim=0)
+        return new_sequence
+    def _prune_hidden_states_position_embeddings(
         self,
         hidden_states: ms.Tensor,
         cu_seqlens: ms.Tensor,
+        position_embeddings: tuple[ms.Tensor, ms.Tensor],
     ) -> tuple[ms.Tensor, ms.Tensor, Optional[dict]]:
         assert cu_seqlens.shape[0] == 3, "cu_seqlens should have 3 elements"
         seq1_len = int(cu_seqlens[1].asnumpy().item())
@@ -671,7 +678,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         keep_mask = ops.logical_not(remove_mask)
         keep_count = int(keep_mask.astype(ms.int32).sum().asnumpy().item())
         if keep_count == seq2_len or keep_count == 0:
-            return hidden_states, cu_seqlens, None
+            return hidden_states, cu_seqlens, position_embeddings, None
 
         keep_indices = ops.nonzero(keep_mask.astype(ms.int32)).flatten().astype(ms.int32)
         removed_indices = ops.nonzero(remove_mask.astype(ms.int32)).flatten().astype(ms.int32)
@@ -681,8 +688,17 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
             [hidden_states[:seq1_len], seq2_kept], dim=0
         )
 
-        keep_count_tensor = ms.Tensor(keep_count, dtype=cu_seqlens.dtype)
-        new_cu = mint.cat([cu_seqlens[:2], keep_count_tensor], dim=0)
+        new_cu = cu_seqlens.copy()
+        new_cu[2] = seq1_len + keep_count
+
+        # 同步裁剪 position_embeddings 以匹配剪枝后的序列长度
+        cos, sin = position_embeddings
+        
+        # seq1 部分保留全部，seq2 部分只保留 keep_indices
+        cos = self._prune_second_sequence(cos, cu_seqlens, keep_indices)
+        sin = self._prune_second_sequence(sin, cu_seqlens, keep_indices)
+        
+        position_embeddings = (cos, sin)
 
         prune_info = {
             "removed_mask": remove_mask,
@@ -691,7 +707,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
             "keep_indices": keep_indices,
             "removed_indices": removed_indices,
         }
-        return new_hidden_states, new_cu, prune_info
+        return new_hidden_states, new_cu, position_embeddings, prune_info
 
     def rot_pos_emb(self, grid_thw: ms.Tensor) -> ms.Tensor:
         merge_size = self.spatial_merge_size
@@ -829,9 +845,10 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         deepstack_feature_lists = []
         prune_state: Optional[dict] = None
         for layer_num, blk in enumerate(self.blocks):
-            if layer_num == 0 and self._should_prune(cu_seqlens):
-                hidden_states, cu_seqlens, prune_state = self._prune_second_sequence(hidden_states, cu_seqlens)
+            if layer_num == 1 and self._should_prune(cu_seqlens):
+                hidden_states, cu_seqlens, position_embeddings, prune_state = self._prune_hidden_states_position_embeddings(hidden_states, cu_seqlens, position_embeddings)
                 # cu_seqlens contains the lengths after pruning
+                
             prune_info = prune_state if prune_state is not None and layer_num >= 1 else None
             hidden_states = blk(
                 hidden_states,

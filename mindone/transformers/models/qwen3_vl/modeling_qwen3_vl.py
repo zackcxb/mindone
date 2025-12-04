@@ -178,7 +178,7 @@ def expand_sequence_with_prune_info(sequence: ms.Tensor, prune_info: dict, cu_se
     seq2_states_pruned = sequence[cu_seqlens[1] : cu_seqlens[2]]
 
     gather_indices = prune_info["removed_indices"]
-    seq2_states_shared = ops.gather(seq1_states, gather_indices, 0)
+    seq2_states_shared = mint.index_select(seq1_states, 0, gather_indices)
 
     seq2_states_full = mint.cat([seq2_states_pruned, seq2_states_shared], dim=0)
 
@@ -647,14 +647,14 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         return bool(self.token_prune_enabled and cu_seqlens.shape[0] >= 3)
 
     def _compute_token_similarity(self, seq1: ms.Tensor, seq2: ms.Tensor) -> ms.Tensor:
-        seq1_norm = seq1 / (ops.norm(seq1, dim=-1, keepdim=True) + TOKEN_SIM_EPS)
-        seq2_norm = seq2 / (ops.norm(seq2, dim=-1, keepdim=True) + TOKEN_SIM_EPS)
+        seq1_norm = seq1 / (mint.linalg.norm(seq1, dim=-1, keepdim=True) + TOKEN_SIM_EPS)
+        seq2_norm = seq2 / (mint.linalg.norm(seq2, dim=-1, keepdim=True) + TOKEN_SIM_EPS)
         return (seq1_norm * seq2_norm).sum(axis=-1)
 
     def _prune_second_sequence(self, sequence: ms.Tensor, cu_seqlens: ms.Tensor, gather_indices: ms.Tensor) -> ms.Tensor:
         seq1_states = sequence[:cu_seqlens[1]]
         seq2_states = sequence[cu_seqlens[1] : cu_seqlens[2]]
-        seq2_kept = ops.gather(seq2_states, gather_indices, 0)
+        seq2_kept = mint.index_select(seq2_states, 0, gather_indices)
         new_sequence = mint.cat([seq1_states, seq2_kept], dim=0)
         return new_sequence
     def _prune_hidden_states_position_embeddings(
@@ -672,14 +672,14 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         similarities = self._compute_token_similarity(seq1_states, seq2_states)
         # threshold = ms.Tensor(self.token_prune_threshold, dtype=similarities.dtype)
         remove_mask = (similarities > self.token_prune_threshold).astype(ms.bool_)
-        keep_mask = ops.logical_not(remove_mask)
+        keep_mask = mint.logical_not(remove_mask)
         keep_count = int(keep_mask.astype(ms.int32).sum().asnumpy().item())
         if keep_count == seq2_len or keep_count == 0:
             return hidden_states, cu_seqlens, position_embeddings, None
 
-        keep_indices = ops.nonzero(keep_mask.astype(ms.int32)).flatten().astype(ms.int32)
-        removed_indices = ops.nonzero(remove_mask.astype(ms.int32)).flatten().astype(ms.int32)
-        seq2_kept = ops.gather(seq2_states, keep_indices, 0)
+        keep_indices = mint.nonzero(keep_mask.astype(ms.int32)).flatten().astype(ms.int32)
+        removed_indices = mint.nonzero(remove_mask.astype(ms.int32)).flatten().astype(ms.int32)
+        seq2_kept = mint.index_select(seq2_states, 0, keep_indices)
 
         new_hidden_states = mint.cat(
             [hidden_states[:seq1_len], seq2_kept], dim=0
@@ -696,7 +696,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         sin = self._prune_second_sequence(sin, cu_seqlens, keep_indices)
         
         new_position_embeddings = (cos, sin)
-
+        print(f"threshold: {self.token_prune_threshold}, keep_count: {keep_count}, compressed ratio: {(seq2_len - keep_count) / seq2_len}")
         prune_info = {
             "removed_mask": remove_mask,
             "keep_mask": keep_mask,
@@ -846,7 +846,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
             if layer_num == 1 and self._should_prune(cu_seqlens):
                 hidden_states, cu_seqlens, position_embeddings, prune_info = self._prune_hidden_states_position_embeddings(hidden_states, cu_seqlens, position_embeddings)
                 # cu_seqlens contains the lengths after pruning
-            if layer_num == self.config.depth - 1:
+            if layer_num == self.config.depth - 1 and prune_info is not None:
                 hidden_states = expand_sequence_with_prune_info(hidden_states, prune_info, cu_seqlens)
                 cu_seqlens = prune_info["original_cu_seqlens"]
                 position_embeddings = prune_info["original_position_embeddings"]
@@ -860,8 +860,12 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
                 **kwargs,
             )
             if layer_num in self.deepstack_visual_indexes:
+                if prune_info is not None:
+                    expanded_hidden_states = expand_sequence_with_prune_info(hidden_states, prune_info, cu_seqlens)
+                else:
+                    expanded_hidden_states = hidden_states
                 deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
-                    hidden_states
+                    expanded_hidden_states
                 )
                 deepstack_feature_lists.append(deepstack_feature)
 

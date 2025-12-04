@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 from typing import List
-
+import time
 import mindspore as ms
 import numpy as np
 
@@ -64,6 +64,23 @@ def generate(args):
     )
 
     model_inputs = _numpy_to_ms(model_inputs)
+    if args.profile:
+        profiler = ms.profiler.Profiler(start_profile=False, output_path="/home/cxb/profiler_data")
+        profiler.start()
+    total_time = 0
+    for i in range(args.num_prefill_only):
+        start_time = time.time()
+        generated_ids = model.generate(
+            **model_inputs,
+            max_new_tokens=1,
+        )
+        if i > 0:
+            total_time += time.time() - start_time
+    print(f"Average time per prefill: {total_time / args.num_prefill_only}")
+    if args.profile:
+        profiler.stop()
+        profiler.analyse()
+
     generated_ids = model.generate(
         **model_inputs,
         max_new_tokens=args.max_new_tokens,
@@ -132,6 +149,17 @@ def parse_args():
         type=float,
         default=0.95,
         help="nucleus sampling 参数",
+    )
+    parser.add_argument(
+        "--num_prefill_only",
+        type=int,
+        default=10,
+        help="只进行 prefill 的次数",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="是否进行 profiling",
     )
     return parser.parse_args()
 

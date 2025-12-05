@@ -637,11 +637,8 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         )
 
         self.gradient_checkpointing = False
-        # TODO: add config for token prune
-        # self.token_prune_enabled = getattr(config, "token_prune_enabled", False)
-        # self.token_prune_threshold = getattr(config, "token_prune_threshold", 0.99)
-        self.token_prune_enabled = True
-        self.token_prune_threshold = 0.99
+        # self.token_prune_enabled = True
+        # self.token_prune_threshold = 0.99
 
     def _should_prune(self, cu_seqlens: ms.Tensor) -> bool:
         return bool(self.token_prune_enabled and cu_seqlens.shape[0] >= 3)
@@ -817,6 +814,9 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         Returns:
             `ms.Tensor`: hidden_states.
         """
+        self.token_prune_enabled = kwargs.get("token_prune_enabled", False)
+        self.token_prune_threshold = kwargs.get("token_prune_threshold", 0.99)
+        print(f"token_prune_enabled: {self.token_prune_enabled}, token_prune_threshold: {self.token_prune_threshold}")
         hidden_states = self.patch_embed(hidden_states)
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
@@ -1147,7 +1147,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
             return position_ids, mrope_position_deltas
 
-    def get_video_features(self, pixel_values_videos: ms.Tensor, video_grid_thw: Optional[ms.Tensor] = None):
+    def get_video_features(self, pixel_values_videos: ms.Tensor, video_grid_thw: Optional[ms.Tensor] = None, **kwargs):
         """
         Encodes videos into continuous embeddings that can be forwarded to the language model. The deepstack visual features are also returned.
 
@@ -1158,9 +1158,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 The temporal, height and width of feature shape of each video in LLM.
         """
         # Same implementation as for images
-        return self.get_image_features(pixel_values_videos, video_grid_thw)
+        return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
-    def get_image_features(self, pixel_values: ms.Tensor, image_grid_thw: Optional[ms.Tensor] = None):
+    def get_image_features(self, pixel_values: ms.Tensor, image_grid_thw: Optional[ms.Tensor] = None, **kwargs):
         """
         Encodes images into continuous embeddings that can be forwarded to the language model. The deepstack visual features are also returned.
 
@@ -1171,7 +1171,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = mint.split(image_embeds, split_sizes)
         return image_embeds, deepstack_image_embeds
@@ -1248,7 +1248,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         video_mask = None
 
         if pixel_values is not None:
-            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw, **kwargs)
             image_embeds = mint.cat(image_embeds, dim=0).to(inputs_embeds.dtype)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -1259,7 +1259,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             )
 
         if pixel_values_videos is not None:
-            video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+            video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
             video_embeds = mint.cat(video_embeds, dim=0).to(inputs_embeds.dtype)
             _, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
@@ -1500,6 +1500,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         pixel_values_videos=None,
         image_grid_thw=None,
         video_grid_thw=None,
+        token_prune_enabled=None,
+        token_prune_threshold=None,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -1516,6 +1518,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             use_cache=use_cache,
+            token_prune_enabled=token_prune_enabled,
+            token_prune_threshold=token_prune_threshold,
             **kwargs,
         )
 

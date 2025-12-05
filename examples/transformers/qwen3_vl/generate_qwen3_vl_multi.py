@@ -64,22 +64,25 @@ def generate(args):
     )
 
     model_inputs = _numpy_to_ms(model_inputs)
-    if args.profile:
-        profiler = ms.profiler.Profiler(start_profile=False, output_path="/home/cxb/profiler_data")
-        profiler.start()
-    total_time = 0
-    for i in range(args.num_prefill_only):
-        start_time = time.time()
-        generated_ids = model.generate(
-            **model_inputs,
-            max_new_tokens=1,
-        )
-        if i > 0:
-            total_time += time.time() - start_time
-    print(f"Average time per prefill: {total_time / args.num_prefill_only}")
-    if args.profile:
-        profiler.stop()
-        profiler.analyse()
+    if args.num_prefill_only > 0:
+        if args.profile:
+            profiler = ms.profiler.Profiler(start_profile=False, output_path="/home/cxb/profiler_data")
+            profiler.start()
+        total_time = 0
+        for i in range(args.num_prefill_only):
+            start_time = time.time()
+            generated_ids = model.generate(
+                **model_inputs,
+                max_new_tokens=1,
+                token_prune_enabled=args.token_prune_enabled,
+                token_prune_threshold=args.token_prune_threshold,
+            )
+            if i > 0:
+                total_time += time.time() - start_time
+        print(f"Average time per prefill: {total_time / args.num_prefill_only}")
+        if args.profile:
+            profiler.stop()
+            profiler.analyse()
 
     generated_ids = model.generate(
         **model_inputs,
@@ -87,6 +90,8 @@ def generate(args):
         do_sample=args.do_sample,
         temperature=args.temperature,
         top_p=args.top_p,
+        token_prune_enabled=args.token_prune_enabled,
+        token_prune_threshold=args.token_prune_threshold,
     )
     generated_ids_trimmed = [
         out_ids[len(in_ids) :] for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)
@@ -160,6 +165,17 @@ def parse_args():
         "--profile",
         action="store_true",
         help="是否进行 profiling",
+    )
+    parser.add_argument(
+        "--token_prune_enabled",
+        action="store_true",
+        help="是否启用 token prune",
+    )
+    parser.add_argument(
+        "--token_prune_threshold",
+        type=float,
+        default=0.99,
+        help="token prune 阈值",
     )
     return parser.parse_args()
 

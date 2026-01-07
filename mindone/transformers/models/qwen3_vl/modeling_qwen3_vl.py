@@ -173,6 +173,10 @@ def eager_attention_forward(
 
 
 def expand_sequence_with_prune_info(sequence: ms.Tensor, prune_info: dict, cu_seqlens: ms.Tensor) -> ms.Tensor:
+    # Handle Summary Token separation
+    if prune_info.get("has_summary_token", False):
+        # Summary token is appended at the end
+        sequence = sequence[:-1]
 
     seq1_states = sequence[:cu_seqlens[1]]
     seq2_states_pruned = sequence[cu_seqlens[1] : cu_seqlens[2]]
@@ -648,6 +652,29 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         seq2_norm = seq2 / (mint.linalg.norm(seq2, dim=-1, keepdim=True) + TOKEN_SIM_EPS)
         return (seq1_norm * seq2_norm).sum(axis=-1)
 
+    def _compute_token_importance(self, hidden_states: ms.Tensor, method: str) -> ms.Tensor:
+        """
+        Compute token importance score for saliency protection.
+        Args:
+            hidden_states: [seq_len, dim]
+            method: "norm" or "attention"
+        """
+        if method == "norm":
+            # Magnitude-based importance: L2 norm of feature vector
+            return mint.linalg.norm(hidden_states, dim=-1)
+        elif method == "attention":
+            # Self-Attention approximation: Column Sum of Softmax(QK^T)
+            # Simulating global attention within the image
+            # A = Softmax(X @ X.T / sqrt(d))
+            scale = hidden_states.shape[-1] ** -0.5
+            # [Seq, Dim] @ [Dim, Seq] -> [Seq, Seq]
+            attn_score = mint.matmul(hidden_states, hidden_states.swapaxes(0, 1)) * scale
+            attn_probs = mint.nn.functional.softmax(attn_score, dim=-1)
+            # Sum over columns: how much other tokens attend to this token
+            return attn_probs.sum(dim=0)
+        else:
+            raise ValueError(f"Unknown saliency method: {method}")
+
     def _prune_second_sequence(self, sequence: ms.Tensor, cu_seqlens: ms.Tensor, gather_indices: ms.Tensor) -> ms.Tensor:
         seq1_states = sequence[:cu_seqlens[1]]
         seq2_states = sequence[cu_seqlens[1] : cu_seqlens[2]]
@@ -669,6 +696,21 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         similarities = self._compute_token_similarity(seq1_states, seq2_states)
         # threshold = ms.Tensor(self.token_prune_threshold, dtype=similarities.dtype)
         remove_mask = (similarities > self.token_prune_threshold).astype(ms.bool_)
+
+        # [Saliency Protection]
+        saliency_method = getattr(self, "saliency_method", None)
+        if saliency_method:
+            saliency_scores = self._compute_token_importance(seq2_states, method=saliency_method)
+            # Protect Top-K important tokens (e.g. top 10%)
+            # This threshold can be exposed as a parameter later
+            k_protect = int(seq2_len * 0.1) 
+            if k_protect > 0:
+                topk_vals, _ = mint.topk(saliency_scores, k=k_protect)
+                threshold_score = topk_vals[-1]
+                protect_mask = (saliency_scores >= threshold_score)
+                # If a token is protected, set remove_mask to False
+                remove_mask = mint.logical_and(remove_mask, mint.logical_not(protect_mask))
+
         keep_mask = mint.logical_not(remove_mask)
         keep_count = int(keep_mask.astype(ms.int32).sum().asnumpy().item())
         if keep_count == seq2_len or keep_count == 0:
@@ -681,9 +723,19 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         new_hidden_states = mint.cat(
             [hidden_states[:seq1_len], seq2_kept], dim=0
         )
+        
+        has_summary_token = False
+        if getattr(self, "enable_summary_token", False) and removed_indices.shape[0] > 0:
+            # Calculate Summary Token (Mean Pooling of removed tokens)
+            removed_tokens = mint.index_select(seq2_states, 0, removed_indices)
+            summary_token = removed_tokens.mean(axis=0, keep_dims=True)  # [1, hidden_size]
+            
+            # Append Summary Token to the sequence
+            new_hidden_states = mint.cat([new_hidden_states, summary_token], dim=0)
+            has_summary_token = True
 
         new_cu = cu_seqlens.copy()
-        new_cu[2] = seq1_len + keep_count
+        new_cu[2] = seq1_len + keep_count + (1 if has_summary_token else 0)
 
         # 同步裁剪 position_embeddings 以匹配剪枝后的序列长度
         cos, sin = position_embeddings
@@ -692,8 +744,19 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         cos = self._prune_second_sequence(cos, cu_seqlens, keep_indices)
         sin = self._prune_second_sequence(sin, cu_seqlens, keep_indices)
         
+        if has_summary_token:
+            # Append a dummy position embedding for the summary token
+            # We reuse the first token's position embedding or zeros
+            # Here reusing the last kept token's pos emb might be safest for broadcasting,
+            # or just zeros if it's "global"
+            # Using slice to keep dims: [1, head_dim]
+
+            # cos = mint.cat([cos, cos[-1:]], dim=0)
+            # sin = mint.cat([sin, sin[-1:]], dim=0)
+            cos = mint.cat([cos, 0], dim=0)
+            sin = mint.cat([sin, 0], dim=0)
         new_position_embeddings = (cos, sin)
-        print(f"threshold: {self.token_prune_threshold}, keep_count: {keep_count}, compressed ratio: {(seq2_len - keep_count) / seq2_len}")
+        print(f"threshold: {self.token_prune_threshold}, keep_count: {keep_count}, compressed ratio: {(seq2_len - keep_count) / seq2_len}, summary_token: {has_summary_token}")
         prune_info = {
             "removed_mask": remove_mask,
             "keep_mask": keep_mask,
@@ -701,6 +764,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
             "keep_indices": keep_indices,
             "removed_indices": removed_indices,
             "original_position_embeddings": position_embeddings,
+            "has_summary_token": has_summary_token,
         }
         return new_hidden_states, new_cu, new_position_embeddings, prune_info
 
@@ -816,7 +880,8 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         """
         self.token_prune_enabled = kwargs.get("token_prune_enabled", False)
         self.token_prune_threshold = kwargs.get("token_prune_threshold", 0.99)
-        print(f"token_prune_enabled: {self.token_prune_enabled}, token_prune_threshold: {self.token_prune_threshold}")
+        self.enable_summary_token = kwargs.get("enable_summary_token", False)
+        print(f"token_prune_enabled: {self.token_prune_enabled}, threshold: {self.token_prune_threshold}, summary: {self.enable_summary_token}")
         hidden_states = self.patch_embed(hidden_states)
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
@@ -1502,6 +1567,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         video_grid_thw=None,
         token_prune_enabled=None,
         token_prune_threshold=None,
+        enable_summary_token=None,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -1520,6 +1586,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             token_prune_enabled=token_prune_enabled,
             token_prune_threshold=token_prune_threshold,
+            enable_summary_token=enable_summary_token,
             **kwargs,
         )
 

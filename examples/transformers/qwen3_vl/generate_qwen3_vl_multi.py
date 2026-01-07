@@ -76,6 +76,7 @@ def generate(args):
                 max_new_tokens=1,
                 token_prune_enabled=args.token_prune_enabled,
                 token_prune_threshold=args.token_prune_threshold,
+                enable_summary_token=args.enable_summary_token,
             )
             if i > 0:
                 total_time += time.time() - start_time
@@ -92,6 +93,7 @@ def generate(args):
         top_p=args.top_p,
         token_prune_enabled=args.token_prune_enabled,
         token_prune_threshold=args.token_prune_threshold,
+        enable_summary_token=args.enable_summary_token,
     )
     generated_ids_trimmed = [
         out_ids[len(in_ids) :] for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)
@@ -176,6 +178,11 @@ def parse_args():
         type=float,
         default=0.99,
         help="token prune 阈值",
+    )
+    parser.add_argument(
+        "--enable_summary_token",
+        action="store_true",
+        help="是否启用 summary token",
     )
     return parser.parse_args()
 

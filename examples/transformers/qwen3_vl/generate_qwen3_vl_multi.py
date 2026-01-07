@@ -77,6 +77,7 @@ def generate(args):
                 token_prune_enabled=args.token_prune_enabled,
                 token_prune_threshold=args.token_prune_threshold,
                 enable_summary_token=args.enable_summary_token,
+                saliency_method=args.saliency_method,
             )
             if i > 0:
                 total_time += time.time() - start_time
@@ -94,6 +95,7 @@ def generate(args):
         token_prune_enabled=args.token_prune_enabled,
         token_prune_threshold=args.token_prune_threshold,
         enable_summary_token=args.enable_summary_token,
+        saliency_method=args.saliency_method,
     )
     generated_ids_trimmed = [
         out_ids[len(in_ids) :] for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)
@@ -184,8 +186,13 @@ def parse_args():
         action="store_true",
         help="是否启用 summary token",
     )
+    parser.add_argument(
+        "--saliency_method",
+        type=str,
+        choices=["norm", "attention"],
+        help="saliency 方法",
+    )
     return parser.parse_args()
-
 
 if __name__ == "__main__":
     generate(parse_args())

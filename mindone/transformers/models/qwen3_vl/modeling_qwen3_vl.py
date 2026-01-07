@@ -881,7 +881,8 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         self.token_prune_enabled = kwargs.get("token_prune_enabled", False)
         self.token_prune_threshold = kwargs.get("token_prune_threshold", 0.99)
         self.enable_summary_token = kwargs.get("enable_summary_token", False)
-        print(f"token_prune_enabled: {self.token_prune_enabled}, threshold: {self.token_prune_threshold}, summary: {self.enable_summary_token}")
+        self.saliency_method = kwargs.get("saliency_method", None)
+        print(f"token_prune_enabled: {self.token_prune_enabled}, threshold: {self.token_prune_threshold}, summary: {self.enable_summary_token}, saliency: {self.saliency_method}")
         hidden_states = self.patch_embed(hidden_states)
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
@@ -1568,6 +1569,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         token_prune_enabled=None,
         token_prune_threshold=None,
         enable_summary_token=None,
+        saliency_method=None,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -1587,6 +1589,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             token_prune_enabled=token_prune_enabled,
             token_prune_threshold=token_prune_threshold,
             enable_summary_token=enable_summary_token,
+            saliency_method=saliency_method,
             **kwargs,
         )
 

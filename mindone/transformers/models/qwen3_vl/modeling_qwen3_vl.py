@@ -753,8 +753,10 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 
             # cos = mint.cat([cos, cos[-1:]], dim=0)
             # sin = mint.cat([sin, sin[-1:]], dim=0)
-            cos = mint.cat([cos, 0], dim=0)
-            sin = mint.cat([sin, 0], dim=0)
+
+            zero_pos = mint.zeros_like(cos[-1:]) 
+            cos = mint.cat([cos, zero_pos], dim=0)
+            sin = mint.cat([sin, zero_pos], dim=0)
         new_position_embeddings = (cos, sin)
         print(f"threshold: {self.token_prune_threshold}, keep_count: {keep_count}, compressed ratio: {(seq2_len - keep_count) / seq2_len}, summary_token: {has_summary_token}")
         prune_info = {

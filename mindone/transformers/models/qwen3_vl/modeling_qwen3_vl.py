@@ -173,21 +173,61 @@ def eager_attention_forward(
 
 
 def expand_sequence_with_prune_info(sequence: ms.Tensor, prune_info: dict, cu_seqlens: ms.Tensor) -> ms.Tensor:
-    # Handle Summary Token separation
-    if prune_info.get("has_summary_token", False):
-        # Summary token is appended at the end
-        sequence = sequence[:-1]
-
-    seq1_states = sequence[:cu_seqlens[1]]
-    seq2_states_pruned = sequence[cu_seqlens[1] : cu_seqlens[2]]
-
-    gather_indices = prune_info["removed_indices"]
-    seq2_states_shared = mint.index_select(seq1_states, 0, gather_indices)
-
-    seq2_states_full = mint.cat([seq2_states_pruned, seq2_states_shared], dim=0)
-
-    new_sequence = mint.cat([seq1_states, seq2_states_full], dim=0)
-    return new_sequence
+    """Restores full sequence using In-Batch Anchor References with Order Preservation."""
+    
+    per_image_info = prune_info["per_image_info"]
+    original_cu = prune_info["original_cu_seqlens"]
+    
+    # Split current compressed sequence
+    curr_lens_np = cu_seqlens.asnumpy()
+    
+    restored_list = []
+    
+    # Pre-calculate slices for O(1) access
+    img_slices = []
+    for i in range(len(per_image_info)):
+        start, end = int(curr_lens_np[i]), int(curr_lens_np[i+1])
+        img_slices.append((start, end))
+        
+    for i, info in enumerate(per_image_info):
+        curr_start, curr_end = img_slices[i]
+        curr_feat = sequence[curr_start:curr_end]
+        
+        if info["is_anchor"]:
+            restored_list.append(curr_feat)
+        else:
+            # 1. Strip Summary Token
+            if info.get("has_summary", False):
+                # Summary is at the end of curr_feat
+                curr_feat = curr_feat[:-1]
+            
+            # 2. Get Anchor Features
+            anchor_idx = info["map_to"]
+            anch_start, anch_end = img_slices[anchor_idx]
+            anchor_feat = sequence[anch_start:anch_end]
+            
+            # 3. Reconstruct with Order Preservation
+            remove_mask = info["removed_mask"] # Bool [Orig_Len]
+            
+            # Derived Indices
+            indices_removed = mint.nonzero(remove_mask.astype(ms.int32)).flatten()
+            indices_kept = mint.nonzero(mint.logical_not(remove_mask).astype(ms.int32)).flatten()
+            
+            # Select parts
+            # kept_feat = curr_feat (Already is)
+            restored_part = mint.index_select(anchor_feat, 0, indices_removed)
+            
+            # Concatenate
+            combined_feat = mint.cat([curr_feat, restored_part], dim=0)
+            combined_indices = mint.cat([indices_kept, indices_removed], dim=0)
+            
+            # Sort back to original order
+            sort_order = mint.argsort(combined_indices)
+            ordered_feat = mint.index_select(combined_feat, 0, sort_order)
+            
+            restored_list.append(ordered_feat)
+            
+    return mint.cat(restored_list, dim=0)
 
 
 class Qwen3VLVisionAttention(nn.Cell):
@@ -687,89 +727,177 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         cu_seqlens: ms.Tensor,
         position_embeddings: tuple[ms.Tensor, ms.Tensor],
     ) -> tuple[ms.Tensor, ms.Tensor, Optional[dict]]:
-        assert cu_seqlens.shape[0] == 3, "cu_seqlens should have 3 elements"
-        seq1_len = int(cu_seqlens[1].asnumpy().item())
-        seq2_len = int((cu_seqlens[2] - cu_seqlens[1]).asnumpy().item())
-        seq1_states = hidden_states[:seq1_len]
-        seq2_states = hidden_states[seq1_len : seq1_len + seq2_len]
-
-        similarities = self._compute_token_similarity(seq1_states, seq2_states)
-        # threshold = ms.Tensor(self.token_prune_threshold, dtype=similarities.dtype)
-        remove_mask = (similarities > self.token_prune_threshold).astype(ms.bool_)
-
-        # [Saliency Protection]
-        saliency_method = getattr(self, "saliency_method", None)
-        if saliency_method:
-            saliency_scores = self._compute_token_importance(seq2_states, method=saliency_method)
-            # Protect Top-K important tokens (e.g. top 10%)
-            # This threshold can be exposed as a parameter later
-            k_protect = int(seq2_len * 0.1) 
-            if k_protect > 0:
-                topk_vals, _ = mint.topk(saliency_scores, k=k_protect)
-                threshold_score = topk_vals[-1]
-                protect_mask = (saliency_scores >= threshold_score)
-                # If a token is protected, set remove_mask to False
-                remove_mask = mint.logical_and(remove_mask, mint.logical_not(protect_mask))
-
-        keep_mask = mint.logical_not(remove_mask)
-        keep_count = int(keep_mask.astype(ms.int32).sum().asnumpy().item())
-        if keep_count == seq2_len or keep_count == 0:
-            return hidden_states, cu_seqlens, position_embeddings, None
-
-        keep_indices = mint.nonzero(keep_mask.astype(ms.int32)).flatten().astype(ms.int32)
-        removed_indices = mint.nonzero(remove_mask.astype(ms.int32)).flatten().astype(ms.int32)
-        seq2_kept = mint.index_select(seq2_states, 0, keep_indices)
-
-        new_hidden_states = mint.cat(
-            [hidden_states[:seq1_len], seq2_kept], dim=0
-        )
         
-        has_summary_token = False
-        if getattr(self, "enable_summary_token", False) and removed_indices.shape[0] > 0:
-            # Calculate Summary Token (Mean Pooling of removed tokens)
-            removed_tokens = mint.index_select(seq2_states, 0, removed_indices)
-            summary_token = removed_tokens.mean(axis=0, keep_dims=True)  # [1, hidden_size]
-            
-            # Append Summary Token to the sequence
-            new_hidden_states = mint.cat([new_hidden_states, summary_token], dim=0)
-            has_summary_token = True
-
-        new_cu = cu_seqlens.copy()
-        new_cu[2] = seq1_len + keep_count + (1 if has_summary_token else 0)
-
-        # 同步裁剪 position_embeddings 以匹配剪枝后的序列长度
+        # 1. Prepare Data
+        fingerprints, splitted_states = self._compute_fingerprints(hidden_states, cu_seqlens)
+        
+        # 2. Select Anchors
+        anchor_indices, target_to_anchor_map = self._select_anchors(fingerprints, threshold=0.85)
+        
+        # 3. Batch Pruning
+        new_states_list = []
+        prune_info_list = []
+        num_images = len(splitted_states)
+        
         cos, sin = position_embeddings
+        new_cos_list, new_sin_list = [], []
         
-        # seq1 部分保留全部，seq2 部分只保留 keep_indices
-        cos = self._prune_second_sequence(cos, cu_seqlens, keep_indices)
-        sin = self._prune_second_sequence(sin, cu_seqlens, keep_indices)
+        seqlens_np = cu_seqlens.asnumpy()
         
-        if has_summary_token:
-            # Append a dummy position embedding for the summary token
-            # We reuse the first token's position embedding or zeros
-            # Here reusing the last kept token's pos emb might be safest for broadcasting,
-            # or just zeros if it's "global"
-            # Using slice to keep dims: [1, head_dim]
+        for i in range(num_images):
+            current_img = splitted_states[i]
+            anchor_idx = target_to_anchor_map[i].item()
+            is_anchor = (i == anchor_idx)
+            
+            # Position Embedding Slice
+            start, end = int(seqlens_np[i]), int(seqlens_np[i+1])
+            curr_cos = cos[start:end]
+            curr_sin = sin[start:end]
+            
+            if is_anchor:
+                # Keep Full Anchor
+                new_states_list.append(current_img)
+                new_cos_list.append(curr_cos)
+                new_sin_list.append(curr_sin)
+                
+                prune_info_list.append({
+                    "is_anchor": True, 
+                    "map_to": i, # Map to self
+                    "original_len": current_img.shape[0]
+                })
+            else:
+                # Prune Target against Anchor
+                anchor_img = splitted_states[anchor_idx]
+                
+                if current_img.shape[0] != anchor_img.shape[0]:
+                    # Fallback: Treat as anchor if shape mismatch
+                    new_states_list.append(current_img)
+                    new_cos_list.append(curr_cos)
+                    new_sin_list.append(curr_sin)
+                    prune_info_list.append({"is_anchor": True, "map_to": i, "original_len": current_img.shape[0]})
+                    continue
 
-            # cos = mint.cat([cos, cos[-1:]], dim=0)
-            # sin = mint.cat([sin, sin[-1:]], dim=0)
+                # Compute Similarity & Masks
+                sim = self._compute_token_similarity(anchor_img, current_img)
+                remove_mask = (sim > self.token_prune_threshold).astype(ms.bool_)
+                
+                # Saliency Protection
+                if getattr(self, "saliency_method", None):
+                    scores = self._compute_token_importance(current_img, self.saliency_method)
+                    k_protect = int(current_img.shape[0] * 0.1)
+                    if k_protect > 0:
+                        topk_vals, _ = mint.topk(scores, k=k_protect)
+                        threshold_score = topk_vals[-1]
+                        protect_mask = (scores >= threshold_score)
+                        remove_mask = mint.logical_and(remove_mask, mint.logical_not(protect_mask))
+                
+                keep_mask = mint.logical_not(remove_mask)
+                keep_count = int(keep_mask.astype(ms.int32).sum().asnumpy().item())
+                
+                # Compression
+                kept_tokens = current_img[keep_mask]
+                curr_cos = curr_cos[keep_mask]
+                curr_sin = curr_sin[keep_mask]
+                
+                # Summary Token
+                has_summary = False
+                if getattr(self, "enable_summary_token", False) and remove_mask.any():
+                    removed = current_img[remove_mask]
+                    summary = removed.mean(axis=0, keep_dims=True)
+                    kept_tokens = mint.cat([kept_tokens, summary], dim=0)
+                    # Dummy Pos Emb for Summary (Zeros)
+                    zero_pos = mint.zeros_like(curr_cos[:1])
+                    curr_cos = mint.cat([curr_cos, zero_pos], dim=0)
+                    curr_sin = mint.cat([curr_sin, zero_pos], dim=0)
+                    has_summary = True
+                
+                new_states_list.append(kept_tokens)
+                new_cos_list.append(curr_cos)
+                new_sin_list.append(curr_sin)
+                
+                print(f"Img {i} (Target) -> Anchor {anchor_idx}: kept {keep_count}/{current_img.shape[0]}")
+                
+                prune_info_list.append({
+                    "is_anchor": False,
+                    "map_to": anchor_idx,
+                    "removed_mask": remove_mask, 
+                    "has_summary": has_summary,
+                    "original_len": current_img.shape[0]
+                })
 
-            zero_pos = mint.zeros_like(cos[-1:]) 
-            cos = mint.cat([cos, zero_pos], dim=0)
-            sin = mint.cat([sin, zero_pos], dim=0)
-        new_position_embeddings = (cos, sin)
-        print(f"threshold: {self.token_prune_threshold}, keep_count: {keep_count}, compressed ratio: {(seq2_len - keep_count) / seq2_len}, summary_token: {has_summary_token}")
+        # 4. Re-batch
+        new_hidden_states = mint.cat(new_states_list, dim=0)
+        new_position_embeddings = (mint.cat(new_cos_list, dim=0), mint.cat(new_sin_list, dim=0))
+        
+        # Rebuild cu_seqlens
+        new_lengths = [x.shape[0] for x in new_states_list]
+        new_cu = mint.cumsum(ms.Tensor([0] + new_lengths, dtype=ms.int32), dim=0)
+        
         prune_info = {
-            "removed_mask": remove_mask,
-            "keep_mask": keep_mask,
+            "per_image_info": prune_info_list,
             "original_cu_seqlens": cu_seqlens,
-            "keep_indices": keep_indices,
-            "removed_indices": removed_indices,
+            "anchor_indices": anchor_indices, # For debug/viz
             "original_position_embeddings": position_embeddings,
-            "has_summary_token": has_summary_token,
         }
         return new_hidden_states, new_cu, new_position_embeddings, prune_info
-
+    def _select_anchors(self, fingerprints: ms.Tensor, threshold: float = 0.85) -> tuple[ms.Tensor, ms.Tensor]:
+        """Selects representative anchor images from the batch."""
+        B = fingerprints.shape[0]
+        # Similarity matrix [B, B]
+        sim_matrix = mint.matmul(fingerprints, fingerprints.T)
+        
+        # 1. First Anchor: Highest degree centrality
+        first_anchor = sim_matrix.sum(dim=1).argmax().item()
+        anchor_indices = [first_anchor]
+        current_max_sims = sim_matrix[:, first_anchor]
+        
+        # 2. Greedy K-Center Expansion
+        # Limit max anchors to avoid worst case (e.g. 50%)
+        max_anchors = max(1, int(B * 0.5)) 
+        
+        for _ in range(max_anchors - 1):
+            worst_idx = current_max_sims.argmin()
+            worst_sim = current_max_sims[worst_idx]
+            
+            if worst_sim >= threshold:
+                break
+                
+            new_anchor = worst_idx.item()
+            if new_anchor in anchor_indices: break
+            
+            anchor_indices.append(new_anchor)
+            current_max_sims = mint.maximum(current_max_sims, sim_matrix[:, new_anchor])
+            
+        anchor_indices = ms.Tensor(anchor_indices, dtype=ms.int32)
+        
+        # 3. Map each target to best anchor
+        sim_to_anchors = sim_matrix[:, anchor_indices] # [B, K]
+        best_anchor_local_idx = sim_to_anchors.argmax(dim=1)
+        target_to_anchor_map = anchor_indices[best_anchor_local_idx] # [B] -> Real Index
+        
+        return anchor_indices, target_to_anchor_map
+    def _compute_fingerprints(self, hidden_states: ms.Tensor, cu_seqlens: ms.Tensor) -> tuple[ms.Tensor, list[ms.Tensor]]:
+        """Splits batch and computes global fingerprint for each image."""
+        num_images = cu_seqlens.shape[0] - 1
+        splitted_states = []
+        fingerprints = []
+        
+        # CPU loop is acceptable for small Batch Size (e.g. 50)
+        # Assuming cu_seqlens is on CPU/Host if possible, otherwise .asnumpy() cost is small once per layer
+        seqlens_np = cu_seqlens.asnumpy()
+        
+        for i in range(num_images):
+            start, end = int(seqlens_np[i]), int(seqlens_np[i+1])
+            img_feat = hidden_states[start:end]
+            splitted_states.append(img_feat)
+            
+            # Global Average Pooling + Normalize
+            feat_mean = img_feat.mean(axis=0)
+            feat_mean = feat_mean / (mint.linalg.norm(feat_mean) + 1e-6)
+            fingerprints.append(feat_mean)
+            
+        fingerprints = mint.stack(fingerprints)
+        return fingerprints, splitted_states
     def rot_pos_emb(self, grid_thw: ms.Tensor) -> ms.Tensor:
         merge_size = self.spatial_merge_size
 
